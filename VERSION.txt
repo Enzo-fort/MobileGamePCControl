@@ -1,0 +1,21 @@
+MobileGamePCControl
+Version 1.0.0
+
+Release: v1.0.0
+Release Type: Initial Release
+
+Platform: Windows 10 / Windows 11
+Architecture: x64
+
+Project: MobileGamePCControl
+Upstream Project: PyMacroRecord
+Upstream Author: LOUDO2
+Upstream Repository: https://github.com/LOUDO2/PyMacroRecord
+
+License: GNU General Public License v3.0 (GPL-3.0)
+
+Build System: PyInstaller
+Executable: MobileGamePCControl.exe
+
+Configuration:
+%LOCALAPPDATA%\MobileGamePCControl\config.json

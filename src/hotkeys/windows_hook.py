@@ -1,0 +1,262 @@
+import ctypes
+import threading
+from ctypes import wintypes
+
+
+user32 = ctypes.WinDLL("user32", use_last_error=True)
+kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+WH_KEYBOARD_LL = 13
+
+WM_QUIT = 0x0012
+WM_KEYDOWN = 0x0100
+WM_KEYUP = 0x0101
+WM_SYSKEYDOWN = 0x0104
+WM_SYSKEYUP = 0x0105
+
+LLKHF_INJECTED = 0x10
+
+
+class KBDLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [
+        ("vkCode", wintypes.DWORD),
+        ("scanCode", wintypes.DWORD),
+        ("flags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ctypes.c_void_p),
+    ]
+
+
+HOOKPROC = ctypes.WINFUNCTYPE(
+    wintypes.LPARAM,
+    ctypes.c_int,
+    wintypes.WPARAM,
+    wintypes.LPARAM,
+)
+
+
+# IMPORTANT: explicitly declare Win32 types for 64-bit Windows.
+user32.SetWindowsHookExW.argtypes = [
+    ctypes.c_int,
+    HOOKPROC,
+    wintypes.HINSTANCE,
+    wintypes.DWORD,
+]
+user32.SetWindowsHookExW.restype = wintypes.HHOOK
+
+user32.UnhookWindowsHookEx.argtypes = [
+    wintypes.HHOOK,
+]
+user32.UnhookWindowsHookEx.restype = wintypes.BOOL
+
+user32.CallNextHookEx.argtypes = [
+    wintypes.HHOOK,
+    ctypes.c_int,
+    wintypes.WPARAM,
+    wintypes.LPARAM,
+]
+user32.CallNextHookEx.restype = wintypes.LPARAM
+
+user32.GetMessageW.argtypes = [
+    ctypes.POINTER(wintypes.MSG),
+    wintypes.HWND,
+    wintypes.UINT,
+    wintypes.UINT,
+]
+user32.GetMessageW.restype = ctypes.c_int
+
+user32.TranslateMessage.argtypes = [
+    ctypes.POINTER(wintypes.MSG),
+]
+user32.TranslateMessage.restype = wintypes.BOOL
+
+user32.DispatchMessageW.argtypes = [
+    ctypes.POINTER(wintypes.MSG),
+]
+user32.DispatchMessageW.restype = wintypes.LPARAM
+
+user32.PostThreadMessageW.argtypes = [
+    wintypes.DWORD,
+    wintypes.UINT,
+    wintypes.WPARAM,
+    wintypes.LPARAM,
+]
+user32.PostThreadMessageW.restype = wintypes.BOOL
+
+kernel32.GetModuleHandleW.argtypes = [
+    wintypes.LPCWSTR,
+]
+kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+
+kernel32.GetCurrentThreadId.argtypes = []
+kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+
+
+class WindowsKeyboardHook:
+    def __init__(self, callback):
+        self.callback = callback
+
+        self.hook = None
+        self.thread = None
+        self.thread_id = None
+
+        self.running = False
+        self.started = threading.Event()
+        self.ready = threading.Event()
+
+        self.last_error = None
+
+        # Keep a permanent reference to the callback.
+        self._hook_proc = HOOKPROC(self._hook_callback)
+
+    def start(self):
+        if self.running:
+            return True
+
+        self.running = True
+        self.started.clear()
+        self.ready.clear()
+        self.last_error = None
+
+        self.thread = threading.Thread(
+            target=self._run,
+            name="MGPC-KeyboardHook",
+            daemon=True,
+        )
+
+        self.thread.start()
+
+        # Wait until SetWindowsHookExW has been attempted.
+        self.ready.wait(timeout=5)
+
+        if self.hook:
+            return True
+
+        self.running = False
+        return False
+
+    def _run(self):
+        self.thread_id = kernel32.GetCurrentThreadId()
+
+        module_handle = kernel32.GetModuleHandleW(None)
+
+        self.hook = user32.SetWindowsHookExW(
+            WH_KEYBOARD_LL,
+            self._hook_proc,
+            module_handle,
+            0,
+        )
+
+        if not self.hook:
+            self.last_error = ctypes.get_last_error()
+            self.ready.set()
+            self.running = False
+            return
+
+        self.ready.set()
+
+        msg = wintypes.MSG()
+
+        while self.running:
+            result = user32.GetMessageW(
+                ctypes.byref(msg),
+                None,
+                0,
+                0,
+            )
+
+            if result == -1:
+                self.last_error = ctypes.get_last_error()
+                break
+
+            if result == 0:
+                break
+
+            user32.TranslateMessage(
+                ctypes.byref(msg)
+            )
+
+            user32.DispatchMessageW(
+                ctypes.byref(msg)
+            )
+
+        if self.hook:
+            user32.UnhookWindowsHookEx(
+                self.hook
+            )
+            self.hook = None
+
+        self.running = False
+
+    def _hook_callback(
+        self,
+        n_code,
+        w_param,
+        l_param,
+    ):
+        if n_code >= 0:
+            try:
+                info = ctypes.cast(
+                    l_param,
+                    ctypes.POINTER(
+                        KBDLLHOOKSTRUCT
+                    ),
+                ).contents
+
+                vk_code = int(info.vkCode)
+                flags = int(info.flags)
+
+                is_key_down = w_param in (
+                    WM_KEYDOWN,
+                    WM_SYSKEYDOWN,
+                )
+
+                is_key_up = w_param in (
+                    WM_KEYUP,
+                    WM_SYSKEYUP,
+                )
+
+                # Ignore keyboard events generated by software.
+                if not (flags & LLKHF_INJECTED):
+                    suppress = self.callback(
+                        vk_code,
+                        is_key_down,
+                        is_key_up,
+                        flags,
+                    )
+
+                    if suppress:
+                        return 1
+
+            except Exception:
+                # Never allow an exception in the hook callback
+                # to break the Windows keyboard hook.
+                pass
+
+        return user32.CallNextHookEx(
+            self.hook,
+            n_code,
+            w_param,
+            l_param,
+        )
+
+    def stop(self):
+        if not self.running:
+            return
+
+        self.running = False
+
+        if self.thread_id:
+            user32.PostThreadMessageW(
+                self.thread_id,
+                WM_QUIT,
+                0,
+                0,
+            )
+
+        if self.thread:
+            self.thread.join(timeout=2)
+
+        self.thread = None
+        self.thread_id = None
+        self.hook = None
